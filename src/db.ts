@@ -117,6 +117,10 @@ export async function withSession<T>(url: string, fn: (session: Session) => Prom
 }
 
 export function errorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message || err.name;
+  // Node reports a refused connection to several addresses (IPv4 + IPv6) as an AggregateError with no message.
+  if (err instanceof AggregateError && err.errors.length > 0) {
+    return [...new Set(err.errors.map(errorMessage))].join('; ');
+  }
+  if (err instanceof Error) return err.message || (err as NodeJS.ErrnoException).code || err.name;
   return String(err);
 }

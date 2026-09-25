@@ -56,6 +56,16 @@ describe('secrets', () => {
     expect(out).toContain('postgres://user:***@host/db');
   });
 
+  it('explains refused connections instead of printing "AggregateError"', async () => {
+    const url = 'postgres://user:hunter2@localhost:1/db';
+    const err = await openSession(url).then(
+      () => null,
+      (e: Error) => e,
+    );
+    expect(err?.message).toMatch(/^Could not connect to postgres:\/\/user:\*\*\*@localhost:1\/db: .*ECONNREFUSED/);
+    expect(err?.message).not.toContain('hunter2');
+  });
+
   it('resolves the URL from --db, then TAPU_DATABASE_URL, then DATABASE_URL', () => {
     expect(resolveDatabaseUrl('a', { TAPU_DATABASE_URL: 'b', DATABASE_URL: 'c' })).toBe('a');
     expect(resolveDatabaseUrl(undefined, { TAPU_DATABASE_URL: 'b', DATABASE_URL: 'c' })).toBe('b');

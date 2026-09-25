@@ -34,16 +34,21 @@ export const SENSITIVE_PATTERNS = [
 
 const SPLIT_PATTERNS = SENSITIVE_PATTERNS.map((p) => p.split('_'));
 
-/** Returns the first pattern the column name matches, or null. */
+/** Returns the most specific (longest) pattern the column name matches, or null. */
 export function matchSensitive(columnName: string): string | null {
   const parts = columnName.toLowerCase().split('_');
+  let best: number | null = null;
   for (let p = 0; p < SPLIT_PATTERNS.length; p++) {
     const pattern = SPLIT_PATTERNS[p]!;
+    if (best !== null && pattern.length <= SPLIT_PATTERNS[best]!.length) continue;
     for (let i = 0; i + pattern.length <= parts.length; i++) {
-      if (pattern.every((part, j) => parts[i + j] === part)) return SENSITIVE_PATTERNS[p]!;
+      if (pattern.every((part, j) => parts[i + j] === part)) {
+        best = p;
+        break;
+      }
     }
   }
-  return null;
+  return best === null ? null : SENSITIVE_PATTERNS[best]!;
 }
 
 export function isSensitiveName(columnName: string): boolean {

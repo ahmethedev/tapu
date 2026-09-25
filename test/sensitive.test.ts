@@ -34,7 +34,7 @@ describe('sensitive column detection', () => {
       for (const name of EXAMPLES[pattern]) {
         expect(isSensitiveName(name), name).toBe(true);
       }
-      expect(matchSensitive(pattern)).not.toBeNull();
+      expect(matchSensitive(pattern)).toBe(pattern);
     });
   }
 

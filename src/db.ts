@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { TapuError, errorMessage } from './errors.js';
 
 export const STATEMENT_TIMEOUT = '15s';
 export const IDLE_IN_TRANSACTION_TIMEOUT = '30s';
@@ -18,13 +19,19 @@ export function resolveDatabaseUrl(
   return undefined;
 }
 
-/** `postgres://user:secret@host/db` -> `postgres://user:***@host/db`. Unparseable input is fully masked. */
+/** Query parameters that can carry credentials; they are left out of redacted URLs. */
+const SENSITIVE_PARAM = /pass|secret|key|token|cert/i;
+
+/**
+ * `postgres://user:secret@host/db?sslpassword=x` -> `postgres://user:***@host/db`.
+ * Sensitive query parameters are omitted. Unparseable input is fully masked.
+ */
 export function redactUrl(url: string): string {
   try {
     const u = new URL(url);
     if (u.password) u.password = '***';
-    for (const key of [...u.searchParams.keys()]) {
-      if (/pass|secret|key|token/i.test(key)) u.searchParams.set(key, '***');
+    for (const key of [...new Set(u.searchParams.keys())]) {
+      if (SENSITIVE_PARAM.test(key)) u.searchParams.delete(key);
     }
     return u.toString().replace('%2A%2A%2A', '***');
   } catch {
@@ -32,21 +39,28 @@ export function redactUrl(url: string): string {
   }
 }
 
-/** Secret substrings of a connection URL, in raw and decoded form. */
+/** Secret substrings of a connection URL, in raw, decoded and re-encoded form. */
 function secretsOf(url: string): string[] {
   const secrets = new Set<string>([url]);
+  const addForms = (value: string) => {
+    secrets.add(value);
+    try {
+      const decoded = decodeURIComponent(value);
+      secrets.add(decoded);
+      secrets.add(encodeURIComponent(decoded));
+    } catch {
+      secrets.add(encodeURIComponent(value));
+    }
+  };
   try {
     const u = new URL(url);
-    if (u.password) {
-      secrets.add(u.password);
-      try {
-        secrets.add(decodeURIComponent(u.password));
-      } catch {
-        // keep the raw form only
-      }
-    }
+    if (u.password) addForms(u.password);
     for (const [key, value] of u.searchParams) {
-      if (value && /pass|secret|key|token/i.test(key)) secrets.add(value);
+      // searchParams values are already decoded.
+      if (value && SENSITIVE_PARAM.test(key)) {
+        secrets.add(value);
+        secrets.add(encodeURIComponent(value));
+      }
     }
   } catch {
     // Not a URL: the whole string is treated as secret.
@@ -70,8 +84,9 @@ export interface Session {
 }
 
 /**
- * Opens a read-only session. All queries run inside one `BEGIN READ ONLY`
- * transaction that is rolled back on close. `search_path` is set to
+ * Opens a read-only session. All queries run inside one read-only,
+ * repeatable-read transaction (one consistent snapshot for the whole
+ * introspection) that is rolled back on close. `search_path` is set to
  * `pg_catalog` so that catalog functions print schema-qualified names.
  */
 export async function openSession(url: string): Promise<Session> {
@@ -85,10 +100,13 @@ export async function openSession(url: string): Promise<Session> {
     await client.query(`SET statement_timeout = '${STATEMENT_TIMEOUT}'`);
     await client.query(`SET idle_in_transaction_session_timeout = '${IDLE_IN_TRANSACTION_TIMEOUT}'`);
     await client.query('SET search_path = pg_catalog');
-    await client.query('BEGIN READ ONLY');
+    await client.query('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
   } catch (err) {
     await client.end().catch(() => {});
-    throw new Error(`Could not connect to ${redactUrl(url)}: ${scrubSecrets(errorMessage(err), url)}`);
+    throw new TapuError(
+      'connection_failed',
+      `Could not connect to ${redactUrl(url)}: ${scrubSecrets(errorMessage(err), url)}`,
+    );
   }
   return {
     async query(sql, params) {
@@ -105,22 +123,15 @@ export async function openSession(url: string): Promise<Session> {
   };
 }
 
+/** Runs `fn` in a read-only session; the session is rolled back and released on success or error. */
 export async function withSession<T>(url: string, fn: (session: Session) => Promise<T>): Promise<T> {
   const session = await openSession(url);
   try {
     return await fn(session);
   } catch (err) {
-    throw new Error(scrubSecrets(errorMessage(err), url));
+    if (err instanceof TapuError) throw err;
+    throw new TapuError('introspection_failed', `Introspection failed: ${scrubSecrets(errorMessage(err), url)}`);
   } finally {
     await session.close().catch(() => {});
   }
-}
-
-export function errorMessage(err: unknown): string {
-  // Node reports a refused connection to several addresses (IPv4 + IPv6) as an AggregateError with no message.
-  if (err instanceof AggregateError && err.errors.length > 0) {
-    return [...new Set(err.errors.map(errorMessage))].join('; ');
-  }
-  if (err instanceof Error) return err.message || (err as NodeJS.ErrnoException).code || err.name;
-  return String(err);
 }

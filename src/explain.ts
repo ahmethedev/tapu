@@ -1,11 +1,83 @@
-import type { Catalog, Column, Relation } from './catalog.js';
-import { loadProject, type Config } from './project.js';
-import { UNTRUSTED_NOTICE, sanitizeUntrusted, stripControlChars } from './sanitize.js';
-import { relationWarnings } from './warnings.js';
-import { isSensitive, readPages, type Frontmatter, type PageFile } from './wiki.js';
+import type { Catalog, Column, ForeignKey, Index, KeyConstraint, Relation, RelationKind } from './catalog.js';
+import { COVERAGE, compareStrings, sha256 } from './catalog.js';
+import { TapuError, errorMessage } from './errors.js';
+import { ProjectFs } from './fsafe.js';
+import { parseQualifiedName, qualifiedId, quoteIdent } from './ident.js';
+import { loadProject, wikiPaths, type Config } from './project.js';
+import { LIMITS, NOTICE, Untrusted, terminalSafe } from './sanitize.js';
+import { relationWarnings, type Warning } from './warnings.js';
+import {
+  RULES_TEMPLATE,
+  humanNotes,
+  isSensitive,
+  pageFront,
+  readPages,
+  type Frontmatter,
+  type PageFile,
+  type PageState,
+} from './wiki.js';
 
-/** Human-written text. Every field is sanitized (see sanitize.ts). */
-export interface Untrusted {
+export const DEFAULT_LIMIT = 50;
+export const MAX_LIMIT = 100;
+export const MAX_TABLES = 20;
+export const MAX_NEIGHBORS = 20;
+
+export interface ExplainRequest {
+  tables?: string[];
+  search?: string;
+  related?: boolean;
+  notes?: boolean;
+  rules?: boolean;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface Source {
+  kind: 'local_snapshot';
+  generatedAt: string;
+  revision: string;
+}
+
+export interface ContextFiles {
+  rules: { path: string; available: boolean; empty?: true };
+}
+
+/** A context problem that is not tied to one relation (per-relation ones are in `warn`). */
+export type Finding = Warning | { code: 'scope_mismatch'; configured: string[]; snapshot: string[] };
+
+interface Envelope {
+  notice: string;
+  source: Source;
+  coverage: typeof COVERAGE;
+  contextFiles: ContextFiles;
+}
+
+interface Extras {
+  untrusted?: { rules?: string };
+  findings?: Finding[];
+  /** JSON Pointers of untrusted fields cut to the output limits. */
+  truncated?: string[];
+  /** Explicitly requested context (notes or rules) could not be read; exit code 2. */
+  partial?: true;
+}
+
+export interface Summary {
+  t: string;
+  kind: RelationKind;
+  columns: number;
+  warn?: number;
+  matchedCols?: string[];
+  untrusted?: { purpose: string };
+}
+
+export interface DiscoveryPayload extends Envelope, Extras {
+  search?: string;
+  page: { total: number; limit: number; nextCursor: string | null };
+  overview?: Summary[];
+  matches?: Summary[];
+}
+
+export interface TableUntrusted {
   purpose?: string;
   owner?: string;
   tags?: string[];
@@ -15,269 +87,568 @@ export interface Untrusted {
   notes?: string;
 }
 
-export interface OverviewEntry {
-  t: string;
-  rows?: number;
-  warn?: number;
-  untrusted?: Pick<Untrusted, 'purpose' | 'notes'>;
-}
-
 export interface TableEntry {
   t: string;
-  kind?: string;
+  state: PageState;
+  kind?: RelationKind;
   rows?: number;
   cols?: string[];
-  pk?: string[];
+  pk?: string;
   uniq?: string[];
   fk?: string[];
   refBy?: string[];
   idx?: string[];
   checks?: string[];
-  warn?: string[];
-  untrusted?: Untrusted;
+  view?: string;
+  partitionKey?: string;
+  warn?: Warning[];
+  contextFile?: string;
+  untrusted?: TableUntrusted;
 }
 
-export interface OverviewPayload {
-  notice: string;
-  overview: OverviewEntry[];
-  enums: Record<string, string[]>;
+export interface EnumEntry {
+  t: string;
+  values: string[];
+  external?: true;
 }
 
-export interface TablesPayload {
-  notice: string;
+export interface Selection {
+  requested: string[];
+  neighbors?: string[];
+  omittedNeighbors?: number;
+  /** Relations referenced by foreign keys of returned tables that have no captured definition. */
+  external?: string[];
+}
+
+export interface DetailPayload extends Envelope, Extras {
+  selection: Selection;
   tables: TableEntry[];
-  enums?: Record<string, string[]>;
+  enums?: EnumEntry[];
 }
 
-export type ExplainPayload = OverviewPayload | TablesPayload;
+export type ExplainPayload = DiscoveryPayload | DetailPayload;
 
-export interface ExplainOptions {
-  tables?: string[];
-  notes?: boolean;
-}
-
-const TEMPLATE_BODY =
-  '## Why it exists\n\n_Not documented yet. What does this table represent, who depends on it, what breaks if it changes?_\n\n## Notes';
-
-/** A relation known to Tapu: live in the catalog, or only a page left behind. */
-interface Subject {
-  id: string;
-  rel: Relation | null;
-  page: PageFile | undefined;
-  front: Frontmatter | null;
-}
-
-function subjects(catalog: Catalog, pages: Map<string, PageFile>): Subject[] {
-  const out: Subject[] = [];
-  const live = new Set(catalog.relations.map((r) => r.id));
-  const front = (p: PageFile | undefined) => (p?.parse.ok ? p.parse.page.front : null);
-  for (const rel of catalog.relations) {
-    const page = pages.get(rel.id);
-    out.push({ id: rel.id, rel, page, front: front(page) });
-  }
-  for (const page of pages.values()) {
-    if (!live.has(page.id)) {
-      out.push({ id: page.id, rel: null, page, front: front(page) });
-    }
-  }
-  return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-}
-
-function warnings(s: Subject): string[] {
-  if (!s.rel) return ['page_removed'];
-  const out = relationWarnings(s.rel, s.front).map((w) =>
-    // Column names in stale notes come from human-written frontmatter.
-    w.startsWith('stale_note: ') ? `stale_note: ${sanitizeUntrusted(w.slice(12), 64).replace(/\n/g, ' ')}` : w,
-  );
-  const pageHash = s.page?.parse.ok ? s.page.parse.page.hash : null;
-  if (pageHash && pageHash !== s.rel.hash) out.push('drift');
-  return out;
-}
-
-function clean(text: string | null | undefined): string | undefined {
-  const t = text?.trim();
-  return t ? sanitizeUntrusted(t) : undefined;
-}
-
-function pageNotes(s: Subject): string | undefined {
-  if (!s.page?.parse.ok) return undefined;
-  const body = s.page.parse.page.notes;
-  return body === TEMPLATE_BODY ? undefined : clean(body);
-}
-
-function compact<T extends object>(obj: T): T | undefined {
-  const entries = Object.entries(obj).filter(([, v]) => v !== undefined);
-  return entries.length > 0 ? (Object.fromEntries(entries) as T) : undefined;
+export interface ExplainResult {
+  payload: ExplainPayload;
+  exitCode: 0 | 2;
 }
 
 // ---------------------------------------------------------------------------
-// Column strings
+// Compact structure strings (grammar documented in the README)
 
+const upper = (s: string) => s.toUpperCase();
+const identList = (cols: string[]) => cols.map(quoteIdent).join(', ');
+const compactList = (cols: string[]) => (cols.length === 1 ? quoteIdent(cols[0]!) : `(${cols.map(quoteIdent).join(',')})`);
+
+/** The definition PostgreSQL prints for a foreign key with these fields, when identifiers need no keyword quoting. */
+function fkDefinition(fk: ForeignKey): string {
+  let s = `FOREIGN KEY (${identList(fk.columns)}) REFERENCES ${fk.ref}(${identList(fk.refColumns)})`;
+  if (fk.match === 'full') s += ' MATCH FULL';
+  if (fk.onUpdate !== 'no action') s += ` ON UPDATE ${upper(fk.onUpdate)}`;
+  if (fk.onDelete !== 'no action') s += ` ON DELETE ${upper(fk.onDelete)}`;
+  if (fk.deferrable) s += ' DEFERRABLE';
+  if (fk.initiallyDeferred) s += ' INITIALLY DEFERRED';
+  if (!fk.validated) s += ' NOT VALID';
+  return s;
+}
+
+/** Modifiers after an FK target; `null` when the compact form would lose part of the definition. */
+function fkModifiers(fk: ForeignKey): string | null {
+  if (fkDefinition(fk) !== fk.definition) return null;
+  let s = '';
+  if (fk.onDelete !== 'no action') s += ` ON DELETE ${upper(fk.onDelete)}`;
+  if (fk.onUpdate !== 'no action') s += ` ON UPDATE ${upper(fk.onUpdate)}`;
+  if (fk.match !== 'simple') s += ` MATCH ${upper(fk.match)}`;
+  if (fk.deferrable) s += fk.initiallyDeferred ? ' DEFERRABLE INITIALLY DEFERRED' : ' DEFERRABLE';
+  if (!fk.validated) s += ' NOT VALID';
+  return s;
+}
+
+function keyIsPlain(k: KeyConstraint, word: string): boolean {
+  return k.definition === `${word} (${identList(k.columns)})`;
+}
+
+/** `(name)` when a constraint does not have PostgreSQL's default name. */
+function nameSuffix(actual: string, defaultName: string): string {
+  return actual === defaultName ? '' : `(${quoteIdent(actual)})`;
+}
+
+/** A trailing cast to the column's own type is implied by assignment and left out. */
 function stripOwnCast(def: string, type: string): string {
   const suffix = `::${type}`;
   return def.endsWith(suffix) ? def.slice(0, -suffix.length) : def;
 }
 
-function onDeleteSuffix(onDelete: string): string {
-  return onDelete === 'no action' ? '' : ` ON DELETE ${onDelete.toUpperCase()}`;
+interface Structure {
+  cols: string[];
+  pk?: string;
+  uniq: string[];
+  fk: string[];
 }
 
-function columnString(rel: Relation, col: Column, front: Frontmatter | null): string {
-  const pk = rel.primaryKey?.columns.length === 1 && rel.primaryKey.columns[0] === col.name;
-  const parts = [col.name, col.type];
-  if (!col.nullable && !pk) parts.push('NOT NULL');
-  if (col.default !== null) parts.push(`DEFAULT ${stripOwnCast(col.default, col.type)}`);
-  if (col.generated !== null) parts.push(`GENERATED AS ${col.generated}`);
-  if (col.identity === 'always') parts.push('IDENTITY ALWAYS');
-  if (col.identity === 'by_default') parts.push('IDENTITY BY DEFAULT');
-  if (pk) parts.push('PK');
-  if (rel.uniques.some((u) => u.columns.length === 1 && u.columns[0] === col.name)) parts.push('UNIQUE');
-  for (const fk of rel.foreignKeys) {
-    if (fk.columns.length === 1 && fk.columns[0] === col.name) {
-      parts.push(`FK→${fk.refTable}.${fk.refColumns[0]}${onDeleteSuffix(fk.onDelete)}`);
+function structure(rel: Relation, front: Frontmatter | null): Structure {
+  const pk = rel.primaryKey;
+  const inlinePk = pk && pk.columns.length === 1 && keyIsPlain(pk, 'PRIMARY KEY') ? pk : null;
+  const inlineUniq = rel.uniques.filter((u) => u.columns.length === 1 && keyIsPlain(u, 'UNIQUE'));
+  const inlineFk = rel.foreignKeys.filter((fk) => fk.columns.length === 1 && fkModifiers(fk) !== null);
+
+  const cols = rel.columns.map((col: Column) => {
+    const parts = [quoteIdent(col.name), col.type];
+    const isPk = inlinePk?.columns[0] === col.name;
+    if (!col.nullable && !isPk) parts.push('NOT NULL');
+    if (isPk) parts.push('PK' + nameSuffix(inlinePk!.name, `${rel.name}_pkey`));
+    for (const u of inlineUniq) {
+      if (u.columns[0] === col.name) parts.push('UNIQUE' + nameSuffix(u.name, `${rel.name}_${col.name}_key`));
     }
-  }
-  if (isSensitive(col, front)) parts.push('SENSITIVE');
-  return parts.join(' ');
-}
-
-const list = (cols: string[]) => (cols.length === 1 ? cols[0]! : `(${cols.join(',')})`);
-
-/** `orders_status_idx(status)`, `daily_sales_day_idx(day) UNIQUE`, `x gin (doc)`. */
-function indexString(name: string, definition: string, unique: boolean): string {
-  const m = / USING (\w+) (.*)$/.exec(definition);
-  const body = m ? (m[1] === 'btree' ? m[2]! : ` ${m[1]} ${m[2]}`) : '';
-  return `${name}${body}${unique ? ' UNIQUE' : ''}`;
-}
-
-function nonEmpty<T>(arr: T[]): T[] | undefined {
-  return arr.length > 0 ? arr : undefined;
-}
-
-function tableEntry(s: Subject, notes: boolean): TableEntry {
-  const front = s.front;
-  const untrusted = compact<Untrusted>({
-    purpose: clean(front?.purpose),
-    owner: clean(front?.owner),
-    tags: front && front.tags.length > 0 ? front.tags.map((t) => sanitizeUntrusted(t)) : undefined,
-    comment: clean(s.rel?.comment),
-    colComments: s.rel
-      ? compact(
-          Object.fromEntries(
-            s.rel.columns.filter((c) => c.comment?.trim()).map((c) => [c.name, sanitizeUntrusted(c.comment!.trim())]),
-          ),
-        )
-      : undefined,
-    colNotes: front
-      ? compact(
-          Object.fromEntries(
-            Object.entries(front.columns)
-              .filter(([, o]) => o.note?.trim())
-              .map(([name, o]) => [sanitizeUntrusted(name, 64), sanitizeUntrusted(o.note!.trim())]),
-          ),
-        )
-      : undefined,
-    notes: notes ? pageNotes(s) : undefined,
+    for (const fk of inlineFk) {
+      if (fk.columns[0] !== col.name) continue;
+      parts.push(
+        `FK${nameSuffix(fk.name, `${rel.name}_${col.name}_fkey`)}→${fk.ref}.${quoteIdent(fk.refColumns[0]!)}${fkModifiers(fk)}`,
+      );
+    }
+    if (col.identity === 'always') parts.push('IDENTITY ALWAYS');
+    if (col.identity === 'by_default') parts.push('IDENTITY BY DEFAULT');
+    if (isSensitive(col, front)) parts.push('SENSITIVE');
+    if (col.generated !== null) parts.push(`GENERATED AS ${col.generated}`);
+    else if (col.default !== null) parts.push(`DEFAULT ${stripOwnCast(col.default, col.type)}`);
+    return parts.join(' ');
   });
 
+  const uniq = rel.uniques
+    .filter((u) => !inlineUniq.includes(u))
+    .map((u) => (keyIsPlain(u, 'UNIQUE') ? `${quoteIdent(u.name)}${compactList(u.columns)}` : `${quoteIdent(u.name)}: ${u.definition}`));
+  const fk = rel.foreignKeys
+    .filter((f) => !inlineFk.includes(f))
+    .map((f) => {
+      const mods = fkModifiers(f);
+      return mods === null
+        ? `${quoteIdent(f.name)}: ${f.definition}`
+        : `${quoteIdent(f.name)}${compactList(f.columns)}→${f.ref}${compactList(f.refColumns)}${mods}`;
+    });
+  const out: Structure = { cols, uniq, fk };
+  if (pk && !inlinePk) {
+    out.pk = keyIsPlain(pk, 'PRIMARY KEY') ? `${quoteIdent(pk.name)}${compactList(pk.columns)}` : `${quoteIdent(pk.name)}: ${pk.definition}`;
+  }
+  return out;
+}
+
+/** `orders_status_idx(status)`, `x UNIQUE INVALID gin (doc)`; the full definition when the table part cannot be stripped. */
+function indexString(rel: Relation, ix: Index): string {
+  const head = `CREATE ${ix.unique ? 'UNIQUE ' : ''}INDEX ${quoteIdent(ix.name)} ON `;
+  const using = ` USING ${ix.method} `;
+  for (const on of [rel.id, `ONLY ${rel.id}`]) {
+    const prefix = head + on + using;
+    if (ix.definition.startsWith(prefix)) {
+      const flags = (ix.unique ? ' UNIQUE' : '') + (ix.valid ? '' : ' INVALID') + (ix.method === 'btree' ? '' : ` ${ix.method}`);
+      return `${quoteIdent(ix.name)}${flags}${flags ? ' ' : ''}${ix.definition.slice(prefix.length)}`;
+    }
+  }
+  return `${quoteIdent(ix.name)}: ${ix.definition}${ix.valid ? '' : ' INVALID'}`;
+}
+
+// ---------------------------------------------------------------------------
+// Subjects: live relations, plus pages left behind by removed/out-of-scope relations
+
+interface Subject {
+  id: string;
+  schema: string;
+  name: string;
+  rel: Relation | null;
+  page: PageFile | undefined;
+  state: PageState;
+}
+
+function subjects(config: Config, catalog: Catalog, pages: Map<string, PageFile>): Map<string, Subject> {
+  const out = new Map<string, Subject>();
+  for (const rel of catalog.relations) {
+    out.set(rel.id, { id: rel.id, schema: rel.schema, name: rel.name, rel, page: pages.get(rel.id), state: 'active' });
+  }
+  const inScope = new Set(config.schemas);
+  for (const page of pages.values()) {
+    if (out.has(page.id)) continue;
+    const state = inScope.has(page.schema) ? 'removed' : 'out_of_scope';
+    out.set(page.id, { id: page.id, schema: page.schema, name: page.name, rel: null, page, state });
+  }
+  return out;
+}
+
+/** Local warnings: structure, frontmatter, and page vs catalog. Explain never sees the live database. */
+function warningsOf(s: Subject): Warning[] {
+  const page = s.page;
+  if (!s.rel) {
+    const out: Warning[] = [{ code: s.state === 'removed' ? 'page_removed' : 'page_out_of_scope' }];
+    if (page && !page.parse.ok) out.push({ code: 'context_invalid', reason: page.parse.reason, file: page.path });
+    return out;
+  }
+  const invalid = page !== undefined && !page.parse.ok;
+  const out = relationWarnings(s.rel, pageFront(page)).filter((w) => !(invalid && w.code === 'undocumented'));
+  if (!page) out.push({ code: 'page_missing' });
+  else if (!page.parse.ok) out.push({ code: 'context_invalid', reason: page.parse.reason, file: page.path });
+  else {
+    const p = page.parse.page;
+    if (p.state !== 'active') out.push({ code: 'page_structure_mismatch', pageState: p.state });
+    else if (p.hash !== s.rel.hash) out.push({ code: 'page_structure_mismatch' });
+    else if (p.docHash !== s.rel.docHash) out.push({ code: 'page_documentation_mismatch' });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Entries
+
+function summary(s: Subject, u: Untrusted, path: (string | number)[]): Summary {
+  const rel = s.rel!;
+  const out: Summary = { t: rel.id, kind: rel.kind, columns: rel.columns.length };
+  const warn = warningsOf(s).length;
+  if (warn > 0) out.warn = warn;
+  const purpose = u.text(pageFront(s.page)?.purpose, LIMITS.overviewPurpose, [...path, 'untrusted', 'purpose']);
+  if (purpose) out.untrusted = { purpose };
+  return out;
+}
+
+function record(entries: [string, string | undefined][]): Record<string, string> | undefined {
+  const out: Record<string, string> = Object.create(null);
+  let any = false;
+  for (const [k, v] of entries) {
+    if (v === undefined) continue;
+    out[k] = v;
+    any = true;
+  }
+  return any ? out : undefined;
+}
+
+function tableUntrusted(
+  s: Subject,
+  front: Frontmatter | null,
+  notes: string | undefined,
+  u: Untrusted,
+  path: (string | number)[],
+): TableUntrusted | undefined {
+  const p = [...path, 'untrusted'];
+  const out: TableUntrusted = {};
+  const set = <K extends keyof TableUntrusted>(k: K, v: TableUntrusted[K] | undefined) => {
+    if (v !== undefined) out[k] = v;
+  };
+  set('purpose', u.text(front?.purpose, LIMITS.field, [...p, 'purpose']));
+  set('owner', u.text(front?.owner, LIMITS.field, [...p, 'owner']));
+  const tags = (front?.tags ?? [])
+    .map((t, i) => u.text(t, LIMITS.field, [...p, 'tags', i]))
+    .filter((t): t is string => t !== undefined);
+  if (tags.length > 0) out.tags = tags;
+  if (s.rel) {
+    set('comment', u.text(s.rel.comment, LIMITS.field, [...p, 'comment']));
+    set(
+      'colComments',
+      record(s.rel.columns.map((c) => [c.name, u.text(c.comment, LIMITS.field, [...p, 'colComments', c.name])])),
+    );
+  }
+  if (front) {
+    set(
+      'colNotes',
+      record(
+        [...front.columns].map(([name, o]) => {
+          const key = u.text(name, LIMITS.field, [...p, 'colNotes', name]) ?? '';
+          return [key, u.text(o.note, LIMITS.field, [...p, 'colNotes', key])];
+        }),
+      ),
+    );
+  }
+  set('notes', notes);
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+interface EntryContext {
+  u: Untrusted;
+  findings: Finding[];
+  partial: { value: boolean };
+}
+
+function tableEntry(s: Subject, withNotes: boolean, index: number, ec: EntryContext): TableEntry {
+  const path = ['tables', index];
+  const page = s.page;
+  const front = pageFront(page);
+  const entry: TableEntry = { t: s.id, state: s.state };
+
+  let notes: string | undefined;
+  if (withNotes && page?.parse.ok) {
+    notes = ec.u.text(humanNotes(page.parse.page, s.id), LIMITS.long, [...path, 'untrusted', 'notes']);
+  } else if (withNotes && page) {
+    ec.partial.value = true; // explicitly requested notes cannot be read safely
+  }
+
   const rel = s.rel;
-  if (!rel) return compact<TableEntry>({ t: s.id, warn: warnings(s), untrusted })!;
-
-  const constraintIndexes = new Set(rel.uniques.map((u) => u.name));
-  return compact<TableEntry>({
-    t: rel.id,
-    kind: rel.kind,
-    rows: rel.rows ?? undefined,
-    cols: rel.columns.map((c) => columnString(rel, c, front)),
-    pk: rel.primaryKey && rel.primaryKey.columns.length > 1 ? rel.primaryKey.columns : undefined,
-    uniq: nonEmpty(rel.uniques.filter((u) => u.columns.length > 1).map((u) => list(u.columns))),
-    fk: nonEmpty(
-      rel.foreignKeys
-        .filter((fk) => fk.columns.length > 1)
-        .map((fk) => `${list(fk.columns)}→${fk.refTable}${list(fk.refColumns)}${onDeleteSuffix(fk.onDelete)}`),
-    ),
-    refBy: nonEmpty(rel.referencedBy.map((r) => `${r.table}.${list(r.columns)}`)),
-    idx: nonEmpty(
-      rel.indexes
-        .filter((i) => !i.primary && !constraintIndexes.has(i.name))
-        .map((i) => indexString(i.name, i.definition, i.unique)),
-    ),
-    checks: nonEmpty(rel.checks.map((c) => `${c.name}: ${c.definition}`)),
-    warn: nonEmpty(warnings(s)),
-    untrusted,
-  })!;
-}
-
-function overviewEntry(s: Subject, notes: boolean): OverviewEntry {
-  const warn = warnings(s).length;
-  return compact<OverviewEntry>({
-    t: s.id,
-    rows: s.rel?.rows ?? undefined,
-    warn: warn > 0 ? warn : undefined,
-    untrusted: compact({
-      purpose: clean(s.front?.purpose) ?? clean(s.rel?.comment),
-      notes: notes ? pageNotes(s) : undefined,
-    }),
-  })!;
-}
-
-// ---------------------------------------------------------------------------
-// Name resolution
-
-export function resolveName(name: string, ids: string[], schemas: string[]): string {
-  if (ids.includes(name)) return name;
-  const candidates = schemas.map((schema) => `${schema}.${name}`).filter((id) => ids.includes(id));
-  if (candidates.length === 1) return candidates[0]!;
-  if (candidates.length > 1) {
-    throw new Error(`Ambiguous relation "${name}". Candidates: ${candidates.join(', ')}`);
+  if (rel) {
+    const st = structure(rel, front);
+    entry.kind = rel.kind;
+    if (rel.rows !== null) entry.rows = rel.rows;
+    entry.cols = st.cols;
+    if (st.pk) entry.pk = st.pk;
+    if (st.uniq.length > 0) entry.uniq = st.uniq;
+    if (st.fk.length > 0) entry.fk = st.fk;
+    if (rel.referencedBy.length > 0) entry.refBy = rel.referencedBy.map((r) => `${r.from}.${compactList(r.columns)}`);
+    const idx = rel.indexes.filter((ix) => ix.constraint === null).map((ix) => indexString(rel, ix));
+    if (idx.length > 0) entry.idx = idx;
+    if (rel.checks.length > 0) entry.checks = rel.checks.map((c) => `${quoteIdent(c.name)}: ${c.definition}`);
+    if (rel.viewDefinition !== null) entry.view = rel.viewDefinition.trim();
+    if (rel.partitionKey !== null) entry.partitionKey = rel.partitionKey;
   }
-  throw new Error(`Unknown relation "${name}". Run \`tapu explain\` to list relations.`);
+  const warn = warningsOf(s).map((w, i) =>
+    w.code === 'stale_note'
+      ? { code: w.code, column: ec.u.text(w.column, LIMITS.field, [...path, 'warn', i, 'column']) ?? '' }
+      : w,
+  );
+  if (warn.length > 0) entry.warn = warn;
+  if (page) entry.contextFile = page.path;
+  const untrusted = tableUntrusted(s, front, notes, ec.u, path);
+  if (untrusted) entry.untrusted = untrusted;
+  return entry;
 }
 
 // ---------------------------------------------------------------------------
+// Requests
 
-export function buildExplain(
+function invalid(message: string, details?: Record<string, unknown>): TapuError {
+  return new TapuError('invalid_arguments', message, details);
+}
+
+export function validateRequest(req: ExplainRequest): void {
+  const detail = (req.tables?.length ?? 0) > 0;
+  if (detail && (req.search !== undefined || req.cursor !== undefined || req.limit !== undefined)) {
+    throw invalid('Relation names cannot be combined with search, cursor or limit. Request details by name, or discover first.', {
+      conflicting: ['tables', ...(['search', 'cursor', 'limit'] as const).filter((k) => req[k] !== undefined)],
+    });
+  }
+  if (!detail && (req.related || req.notes)) {
+    throw invalid('--related and --notes need explicit relation names, e.g. tapu explain orders --related --notes.', {
+      conflicting: (['related', 'notes'] as const).filter((k) => req[k]),
+    });
+  }
+  if (req.limit !== undefined && !(Number.isInteger(req.limit) && req.limit >= 1 && req.limit <= MAX_LIMIT)) {
+    throw invalid(`limit must be an integer from 1 to ${MAX_LIMIT}.`, { limit: req.limit, max: MAX_LIMIT });
+  }
+  if (req.search !== undefined && req.search.trim() === '') throw invalid('search text must not be empty.');
+}
+
+interface Problem {
+  input: string;
+  code: 'invalid_name' | 'unknown_relation' | 'ambiguous_name';
+  candidates?: string[];
+}
+
+function resolveNames(inputs: string[], config: Config, all: Map<string, Subject>): string[] {
+  const ids: string[] = [];
+  const problems: Problem[] = [];
+  for (const input of inputs) {
+    const parts = parseQualifiedName(input);
+    if (!parts) {
+      problems.push({ input, code: 'invalid_name' });
+      continue;
+    }
+    const candidates =
+      parts.length === 2
+        ? [qualifiedId(parts[0]!, parts[1]!)].filter((id) => all.has(id))
+        : config.schemas.map((schema) => qualifiedId(schema, parts[0]!)).filter((id) => all.has(id));
+    if (candidates.length === 1) ids.push(candidates[0]!);
+    else if (candidates.length > 1) problems.push({ input, code: 'ambiguous_name', candidates });
+    else {
+      const name = parts[parts.length - 1]!.toLowerCase();
+      const similar = [...all.values()].filter((s) => s.name.toLowerCase() === name).map((s) => s.id);
+      problems.push({ input, code: 'unknown_relation', ...(similar.length > 0 ? { candidates: similar } : {}) });
+    }
+  }
+  if (problems.length > 0) {
+    const first = problems[0]!;
+    const message = {
+      invalid_name: `"${first.input}" is not a valid relation name. Use name, schema.name or "Quoted"."Name".`,
+      ambiguous_name: `"${first.input}" matches several relations; use a qualified name: ${first.candidates?.join(', ')}.`,
+      unknown_relation: `Unknown relation "${first.input}". Use tapu explain --search <text> to find it.`,
+    }[first.code];
+    throw new TapuError(first.code, message, { problems, next: 'tapu explain --search <text>' });
+  }
+  return [...new Set(ids)];
+}
+
+function cursorBinding(revision: string, search: string | null): string {
+  return sha256(['tapu-explain-cursor-1', revision, search]).slice(0, 24);
+}
+
+function encodeCursor(offset: number, binding: string): string {
+  return Buffer.from(JSON.stringify({ o: offset, b: binding })).toString('base64url');
+}
+
+function decodeCursor(cursor: string, binding: string, total: number): number {
+  const restart = { next: 'Restart discovery without --cursor.' };
+  let value: unknown;
+  try {
+    value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+  } catch {
+    throw new TapuError('cursor_invalid', 'The cursor is malformed. Restart discovery without --cursor.', restart);
+  }
+  const v = value as { o?: unknown; b?: unknown };
+  if (!v || typeof v !== 'object' || !Number.isInteger(v.o) || (v.o as number) < 0 || typeof v.b !== 'string') {
+    throw new TapuError('cursor_invalid', 'The cursor is malformed. Restart discovery without --cursor.', restart);
+  }
+  if (v.b !== binding || (v.o as number) >= Math.max(total, 1)) {
+    throw new TapuError(
+      'cursor_invalid',
+      'The cursor belongs to a different snapshot or search. The catalog may have been refreshed; restart discovery without --cursor.',
+      restart,
+    );
+  }
+  return v.o as number;
+}
+
+async function readRules(
+  fs: ProjectFs,
   config: Config,
-  catalog: Catalog,
-  pages: Map<string, PageFile>,
-  opts: ExplainOptions = {},
-): ExplainPayload {
-  const all = subjects(catalog, pages);
-  const notes = opts.notes ?? false;
-  const enumsOf = (ids: Set<string> | null) =>
-    Object.fromEntries(catalog.enums.filter((e) => !ids || ids.has(e.id)).map((e) => [e.id, e.values]));
-
-  if (!opts.tables || opts.tables.length === 0) {
-    return { notice: UNTRUSTED_NOTICE, overview: all.map((s) => overviewEntry(s, notes)), enums: enumsOf(null) };
+  want: boolean,
+  ec: EntryContext,
+): Promise<{ files: ContextFiles; rules?: string }> {
+  const path = wikiPaths(config).rules;
+  let text: string | null;
+  try {
+    text = await fs.read(path);
+  } catch (err) {
+    if (want) {
+      const reason = err instanceof TapuError ? err.message : `cannot be read (${errorMessage(err)})`;
+      ec.findings.push({ code: 'context_invalid', reason, file: path });
+      ec.partial.value = true;
+    }
+    return { files: { rules: { path, available: false } } };
   }
-
-  const ids = all.map((s) => s.id);
-  const wanted = [...new Set(opts.tables.map((n) => resolveName(n, ids, config.schemas)))];
-  const chosen = wanted.map((id) => all.find((s) => s.id === id)!);
-  const usedEnums = new Set(chosen.flatMap((s) => s.rel?.columns.map((c) => c.enumType ?? '') ?? []));
-  const enums = enumsOf(usedEnums);
+  if (text === null) {
+    if (want) ec.findings.push({ code: 'rules_missing', file: path });
+    return { files: { rules: { path, available: false } } };
+  }
+  if (text === RULES_TEMPLATE) return { files: { rules: { path, available: true, empty: true } } };
   return {
-    notice: UNTRUSTED_NOTICE,
-    tables: chosen.map((s) => tableEntry(s, notes)),
-    ...(Object.keys(enums).length > 0 ? { enums } : {}),
+    files: { rules: { path, available: true } },
+    rules: want ? ec.u.text(text, LIMITS.long, ['untrusted', 'rules']) : undefined,
   };
 }
 
-/** Reads `.tapu/catalog.json` and the wiki pages. Never connects to the database. */
-export async function explain(root: string, opts: ExplainOptions = {}): Promise<ExplainPayload> {
-  const { config, catalog } = await loadProject(root);
-  const pages = await readPages(root, config);
-  return buildExplain(config, catalog, pages, opts);
+function finish<T extends ExplainPayload>(payload: T, rules: string | undefined, ec: EntryContext): ExplainResult {
+  if (rules !== undefined) payload.untrusted = { rules };
+  if (ec.findings.length > 0) payload.findings = ec.findings;
+  if (ec.u.truncated.length > 0) payload.truncated = ec.u.truncated;
+  if (ec.partial.value) payload.partial = true;
+  return { payload, exitCode: ec.partial.value ? 2 : 0 };
+}
+
+/** Builds an explain response from local files only. Never connects to the database. */
+export async function explain(root: string, req: ExplainRequest = {}): Promise<ExplainResult> {
+  validateRequest(req);
+  const fs = await ProjectFs.open(root);
+  const { config, catalog } = await loadProject(fs);
+  const pages = await readPages(fs, config);
+  const all = subjects(config, catalog, pages);
+  const ec: EntryContext = { u: new Untrusted(), findings: [], partial: { value: false } };
+
+  if (JSON.stringify(config.schemas) !== JSON.stringify(catalog.schemas)) {
+    ec.findings.push({ code: 'scope_mismatch', configured: config.schemas, snapshot: catalog.schemas });
+  }
+  const { files, rules } = await readRules(fs, config, req.rules ?? false, ec);
+  const envelope: Envelope = {
+    notice: NOTICE,
+    source: { kind: 'local_snapshot', generatedAt: catalog.generatedAt, revision: catalog.revision },
+    coverage: COVERAGE,
+    contextFiles: files,
+  };
+
+  if (!req.tables || req.tables.length === 0) {
+    const search = req.search?.trim().toLowerCase() ?? null;
+    let active = catalog.relations.map((r) => all.get(r.id)!);
+    const matched = new Map<string, string[]>();
+    if (search !== null) {
+      const ranked: { s: Subject; rank: number }[] = [];
+      for (const s of active) {
+        const rel = s.rel!;
+        const names = [rel.name, `${rel.schema}.${rel.name}`, rel.id].map((n) => n.toLowerCase());
+        const cols = rel.columns.map((c) => c.name).filter((c) => c.toLowerCase().includes(search));
+        const rank = names.includes(search)
+          ? 0
+          : cols.some((c) => c.toLowerCase() === search)
+            ? 1
+            : cols.length > 0 || names.some((n) => n.includes(search))
+              ? 2
+              : -1;
+        if (rank === -1) continue;
+        ranked.push({ s, rank });
+        if (cols.length > 0) matched.set(rel.id, cols);
+      }
+      ranked.sort((a, b) => a.rank - b.rank || compareStrings(a.s.id, b.s.id));
+      active = ranked.map((r) => r.s);
+    }
+    const limit = req.limit ?? DEFAULT_LIMIT;
+    const binding = cursorBinding(catalog.revision, search);
+    const offset = req.cursor === undefined ? 0 : decodeCursor(req.cursor, binding, active.length);
+    const slice = active.slice(offset, offset + limit);
+    const key = search === null ? 'overview' : 'matches';
+    const entries = slice.map((s, i) => {
+      const e = summary(s, ec.u, [key, i]);
+      const cols = matched.get(s.id);
+      return cols ? { ...e, matchedCols: cols } : e;
+    });
+    const next = offset + limit < active.length ? encodeCursor(offset + limit, binding) : null;
+    const page = { total: active.length, limit, nextCursor: next };
+    const payload: DiscoveryPayload =
+      search === null
+        ? { ...envelope, page, overview: entries }
+        : { ...envelope, search: req.search!.trim(), page, matches: entries };
+    return finish(payload, rules, ec);
+  }
+
+  const requested = resolveNames(req.tables, config, all);
+  if (requested.length > MAX_TABLES) {
+    throw new TapuError(
+      'too_many_relations',
+      `At most ${MAX_TABLES} relations per request (got ${requested.length}). Split the request into smaller batches.`,
+      { requested: requested.length, max: MAX_TABLES },
+    );
+  }
+
+  const selection: Selection = { requested };
+  let neighbors: string[] = [];
+  if (req.related) {
+    const wanted = new Set(requested);
+    const found = new Set<string>();
+    for (const id of requested) {
+      const rel = all.get(id)!.rel;
+      if (!rel) continue;
+      for (const fk of rel.foreignKeys) if (all.get(fk.ref)?.rel && !wanted.has(fk.ref)) found.add(fk.ref);
+      for (const r of rel.referencedBy) if (!wanted.has(r.from)) found.add(r.from);
+    }
+    const sorted = [...found].sort(compareStrings);
+    neighbors = sorted.slice(0, MAX_NEIGHBORS);
+    selection.neighbors = neighbors;
+    selection.omittedNeighbors = sorted.length - neighbors.length;
+  }
+
+  const chosen = [...requested, ...neighbors].map((id) => all.get(id)!);
+  const tables = chosen.map((s, i) => tableEntry(s, (req.notes ?? false) && i < requested.length, i, ec));
+
+  const external = new Set<string>();
+  const enumIds = new Set<string>();
+  for (const s of chosen) {
+    for (const fk of s.rel?.foreignKeys ?? []) if (!all.get(fk.ref)?.rel) external.add(fk.ref);
+    for (const c of s.rel?.columns ?? []) if (c.enumType) enumIds.add(c.enumType);
+  }
+  if (external.size > 0) selection.external = [...external].sort(compareStrings);
+  const enums: EnumEntry[] = catalog.enums
+    .filter((e) => enumIds.has(e.id))
+    .map((e) => (e.external ? { t: e.id, values: e.values, external: true } : { t: e.id, values: e.values }));
+
+  const payload: DetailPayload = { ...envelope, selection, tables, ...(enums.length > 0 ? { enums } : {}) };
+  return finish(payload, rules, ec);
 }
 
 // ---------------------------------------------------------------------------
-// Human-readable output
+// Human-readable output (same content; untrusted text grouped under "untrusted")
 
-function untrustedLines(u: Untrusted | undefined, indent: string): string[] {
+function untrustedLines(u: TableUntrusted | undefined, indent: string): string[] {
   if (!u) return [];
-  const out: string[] = [];
-  const add = (label: string, text: string) =>
-    out.push(`${indent}[untrusted] ${label}: ${text.replace(/\n/g, `\n${indent}    `)}`);
+  const out = [`${indent}untrusted:`];
+  const add = (label: string, text: string) => out.push(`${indent}  ${label}: ${text.replace(/\n/g, `\n${indent}    `)}`);
   if (u.purpose) add('purpose', u.purpose);
   if (u.owner) add('owner', u.owner);
   if (u.tags) add('tags', u.tags.join(', '));
@@ -288,40 +659,63 @@ function untrustedLines(u: Untrusted | undefined, indent: string): string[] {
   return out;
 }
 
-export function formatExplainHuman(payload: ExplainPayload): string {
-  const lines = [`Note: ${payload.notice}`, ''];
-  if ('overview' in payload) {
-    lines.push(`${payload.overview.length} relations:`);
-    for (const e of payload.overview) {
-      const meta = [e.rows !== undefined ? `~${e.rows} rows` : undefined, e.warn ? `${e.warn} warnings` : undefined]
-        .filter(Boolean)
-        .join(', ');
-      lines.push(`- ${e.t}${meta ? ` (${meta})` : ''}`, ...untrustedLines(e.untrusted, '    '));
+function warningLabel(w: Warning | Finding): string {
+  const detail = Object.entries(w)
+    .filter(([k]) => k !== 'code')
+    .map(([k, v]) => `${k}=${Array.isArray(v) ? v.join(',') : String(v)}`)
+    .join(' ');
+  return detail ? `${w.code} (${detail})` : w.code;
+}
+
+export function formatExplainHuman(p: ExplainPayload): string {
+  const lines = [`Note: ${p.notice}`, `Source: local snapshot from ${p.source.generatedAt}, revision ${p.source.revision.slice(0, 12)} (${p.coverage}); not checked against the live database.`, ''];
+  const rules = p.contextFiles.rules;
+  if ('page' in p) {
+    const entries = p.overview ?? p.matches ?? [];
+    const what = p.search !== undefined ? `matches for "${p.search}"` : 'relations';
+    lines.push(`${p.page.total} ${what} (showing ${entries.length}):`);
+    for (const e of entries) {
+      const meta = [e.kind, `${e.columns} columns`, e.warn ? `${e.warn} warnings` : undefined].filter(Boolean).join(', ');
+      lines.push(`- ${e.t} (${meta})${e.matchedCols ? ` columns: ${e.matchedCols.join(', ')}` : ''}`);
+      if (e.untrusted) lines.push(`    untrusted: purpose: ${e.untrusted.purpose}`);
     }
+    if (p.page.nextCursor) lines.push(`More: --cursor ${p.page.nextCursor}`);
   } else {
-    for (const t of payload.tables) {
-      const meta = [t.kind, t.rows !== undefined ? `~${t.rows} rows` : undefined].filter(Boolean).join(', ');
-      lines.push(`${t.t}${meta ? ` (${meta})` : ''}`);
+    const sel = p.selection;
+    if (sel.neighbors) {
+      lines.push(`Neighbors: ${sel.neighbors.join(', ') || 'none'}${sel.omittedNeighbors ? ` (+${sel.omittedNeighbors} omitted)` : ''}`);
+    }
+    if (sel.external) lines.push(`Referenced but not captured: ${sel.external.join(', ')}`);
+    if (sel.neighbors || sel.external) lines.push('');
+    for (const t of p.tables) {
+      const meta = [t.kind ?? t.state, t.rows !== undefined ? `~${t.rows} rows` : undefined].filter(Boolean).join(', ');
+      lines.push(`${t.t} (${meta})`);
       const section = (label: string, items: string[] | undefined) => {
-        if (!items) return;
-        lines.push(`  ${label}:`, ...items.map((i) => `    ${i}`));
+        if (items && items.length > 0) lines.push(`  ${label}:`, ...items.map((i) => `    ${i.replace(/\n/g, '\n    ')}`));
       };
       section('columns', t.cols);
-      section('primary key', t.pk ? [list(t.pk)] : undefined);
+      section('primary key', t.pk ? [t.pk] : undefined);
       section('unique', t.uniq);
       section('foreign keys', t.fk);
       section('referenced by', t.refBy);
       section('indexes', t.idx);
       section('checks', t.checks);
-      section('warnings', t.warn);
+      section('view definition', t.view ? [t.view] : undefined);
+      section('partition key', t.partitionKey ? [t.partitionKey] : undefined);
+      section('warnings', t.warn?.map(warningLabel));
+      if (t.contextFile) lines.push(`  context file: ${t.contextFile}`);
       lines.push(...untrustedLines(t.untrusted, '  '), '');
     }
+    if (p.enums) {
+      lines.push('Enums:');
+      for (const e of p.enums) lines.push(`- ${e.t}${e.external ? ' (external)' : ''}: ${e.values.join(', ')}`);
+    }
   }
-  const enums = payload.enums ?? {};
-  if (Object.keys(enums).length > 0) {
-    lines.push('', 'Enums:');
-    for (const [id, values] of Object.entries(enums)) lines.push(`- ${id}: ${values.join(', ')}`);
-  }
-  // Identifiers can contain control characters (e.g. terminal escapes) when quoted; JSON escapes them, text must not carry them.
-  return stripControlChars(lines.join('\n').replace(/\n+$/, '')) + '\n';
+  lines.push('', `Rules: ${rules.path} (${rules.available ? (rules.empty ? 'no conventions supplied' : 'available') : 'missing'})`);
+  if (p.untrusted?.rules) lines.push('untrusted:', `  rules: ${p.untrusted.rules.replace(/\n/g, '\n    ')}`);
+  if (p.findings) lines.push('Findings:', ...p.findings.map((f) => `- ${warningLabel(f)}`));
+  if (p.truncated) lines.push(`Truncated fields (see the context files): ${p.truncated.join(', ')}`);
+  if (p.partial) lines.push('Partial: requested context could not be read.');
+  // Identifiers and prose can contain control characters; JSON escapes them, text must not carry them.
+  return terminalSafe(lines.join('\n').replace(/\n{3,}/g, '\n\n').replace(/\n+$/, '')) + '\n';
 }

@@ -1,11 +1,13 @@
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import pg from 'pg';
 
 const here = dirname(fileURLToPath(import.meta.url));
+// Also works when compiled into dist/test/ (scripts/token-compare.ts imports these helpers).
+const TEST_DIR = here.split(sep).includes('dist') ? join(here, '..', '..', 'test') : here;
 
 /**
  * Admin connection for tests (owner of an explicitly designated, disposable
@@ -23,8 +25,8 @@ export const ADMIN_URL = (() => {
   return url;
 })();
 
-export const CLI_PATH = join(here, '..', 'dist', 'src', 'cli.js');
-export const NET_GUARD = join(here, 'net-guard.mjs');
+export const CLI_PATH = join(TEST_DIR, '..', 'dist', 'src', 'cli.js');
+export const NET_GUARD = join(TEST_DIR, 'net-guard.mjs');
 
 /** Runs SQL as the admin role (the test harness, not Tapu). */
 export async function adminSql(sql: string): Promise<void> {
@@ -39,7 +41,7 @@ export async function adminSql(sql: string): Promise<void> {
 
 /** Drops the fixture schemas and loads test/fixture.sql from scratch. */
 export async function resetFixture(): Promise<void> {
-  const fixture = await readFile(join(here, 'fixture.sql'), 'utf8');
+  const fixture = await readFile(join(TEST_DIR, 'fixture.sql'), 'utf8');
   await adminSql(`
     DROP SCHEMA IF EXISTS billing CASCADE;
     DROP SCHEMA IF EXISTS ext CASCADE;

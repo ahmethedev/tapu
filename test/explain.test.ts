@@ -203,6 +203,23 @@ describe('tapu explain', () => {
     await adminSql('DROP TABLE billing.orders');
   });
 
+  it('treats a column entry named __proto__ as an ordinary (stale) key', async () => {
+    await editFrontmatter(root, 'public.orders', 'columns:\n  __proto__: { sensitive: false, note: "x" }');
+    const orders = ((await explain(root, { tables: ['orders'] })) as TablesPayload).tables[0]!;
+    expect(orders.cols).toContain('shipping_address text SENSITIVE');
+    expect(orders.warn).toContain('stale_note: __proto__');
+    expect(orders.untrusted?.colNotes).toEqual(JSON.parse('{"__proto__":"x"}'));
+  });
+
+  it('strips control characters from identifiers in --human output', async () => {
+    await adminSql(`CREATE TABLE public."evil\u001b[31m" (id int PRIMARY KEY)`);
+    await runInit({ root, url: ADMIN_URL });
+    const human = formatExplainHuman(await explain(root));
+    expect(human).toContain('- public.evil[31m');
+    expect(human).not.toContain('\u001b');
+    await adminSql(`DROP TABLE public."evil\u001b[31m"`);
+  });
+
   it('fails with a hint before init', async () => {
     await expect(explain(await tempRoot())).rejects.toThrow('Run `tapu init` first');
   });

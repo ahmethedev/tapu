@@ -1,6 +1,6 @@
 import type { Catalog, Column, Relation } from './catalog.js';
 import { loadProject, type Config } from './project.js';
-import { UNTRUSTED_NOTICE, sanitizeUntrusted } from './sanitize.js';
+import { UNTRUSTED_NOTICE, sanitizeUntrusted, stripControlChars } from './sanitize.js';
 import { relationWarnings } from './warnings.js';
 import { isSensitive, readPages, type Frontmatter, type PageFile } from './wiki.js';
 
@@ -69,13 +69,14 @@ interface Subject {
 
 function subjects(catalog: Catalog, pages: Map<string, PageFile>): Subject[] {
   const out: Subject[] = [];
+  const live = new Set(catalog.relations.map((r) => r.id));
   const front = (p: PageFile | undefined) => (p?.parse.ok ? p.parse.page.front : null);
   for (const rel of catalog.relations) {
     const page = pages.get(rel.id);
     out.push({ id: rel.id, rel, page, front: front(page) });
   }
   for (const page of pages.values()) {
-    if (!catalog.relations.some((r) => r.id === page.id)) {
+    if (!live.has(page.id)) {
       out.push({ id: page.id, rel: null, page, front: front(page) });
     }
   }
@@ -321,5 +322,6 @@ export function formatExplainHuman(payload: ExplainPayload): string {
     lines.push('', 'Enums:');
     for (const [id, values] of Object.entries(enums)) lines.push(`- ${id}: ${values.join(', ')}`);
   }
-  return lines.join('\n').replace(/\n+$/, '') + '\n';
+  // Identifiers can contain control characters (e.g. terminal escapes) when quoted; JSON escapes them, text must not carry them.
+  return stripControlChars(lines.join('\n').replace(/\n+$/, '')) + '\n';
 }

@@ -47,7 +47,8 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 export function normalizeFrontmatter(value: unknown): Frontmatter {
   const v = isRecord(value) ? value : {};
-  const columns: Record<string, ColumnOverride> = {};
+  // Null prototype: a column entry named `__proto__` must stay an ordinary key.
+  const columns: Record<string, ColumnOverride> = Object.create(null);
   if (isRecord(v.columns)) {
     for (const [name, raw] of Object.entries(v.columns)) {
       const override: ColumnOverride = {};

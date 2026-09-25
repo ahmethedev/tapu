@@ -2,7 +2,7 @@ import type { Catalog } from './catalog.js';
 import { withSession } from './db.js';
 import { introspect } from './introspect.js';
 import { loadProject, type Config } from './project.js';
-import { sanitizeUntrusted } from './sanitize.js';
+import { sanitizeUntrusted, stripControlChars } from './sanitize.js';
 import { staleNotes } from './warnings.js';
 import { pageRelPath, readPages, type PageFile } from './wiki.js';
 
@@ -105,5 +105,5 @@ export function formatStatusHuman(report: StatusReport): string {
   add('broken pages', report.pages.broken.map((b) => `${b.file} (${b.reason})`));
   add('stale column notes', report.staleNotes.map((s) => `${s.t}.${s.col}`));
   lines.push('Run `tapu init` to refresh the catalog and wiki; fix broken pages, stale notes and removed pages by hand.');
-  return lines.join('\n') + '\n';
+  return stripControlChars(lines.join('\n')) + '\n';
 }

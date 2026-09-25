@@ -16,6 +16,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.check.json",
     "test": "vitest run",
     "token-compare": "npm run build && node dist/scripts/token-compare.js"

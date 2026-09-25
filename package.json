@@ -1,0 +1,35 @@
+{
+  "name": "tapu",
+  "version": "0.1.0",
+  "description": "Agent-native memory layer for Postgres: a living, verified wiki of your schema for coding agents.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "bin": {
+    "tapu": "dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "test": "vitest run",
+    "token-compare": "npm run build && node dist/scripts/token-compare.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "commander": "^14.0.3",
+    "pg": "^8.23.0",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "@types/pg": "^8.23.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.2"
+  }
+}

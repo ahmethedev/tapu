@@ -10,10 +10,12 @@ import {
   RULES_TEMPLATE,
   humanNotes,
   isSensitive,
+  listPages,
   pageFront,
-  readPages,
+  readPage,
   type Frontmatter,
   type PageFile,
+  type PageRef,
   type PageState,
 } from './wiki.js';
 
@@ -254,22 +256,28 @@ interface Subject {
   schema: string;
   name: string;
   rel: Relation | null;
-  page: PageFile | undefined;
+  ref: PageRef | undefined;
+  /** Read only for subjects that appear in the response (see loadPages). */
+  page?: PageFile;
   state: PageState;
 }
 
-function subjects(config: Config, catalog: Catalog, pages: Map<string, PageFile>): Map<string, Subject> {
+function subjects(config: Config, catalog: Catalog, refs: Map<string, PageRef>): Map<string, Subject> {
   const out = new Map<string, Subject>();
   for (const rel of catalog.relations) {
-    out.set(rel.id, { id: rel.id, schema: rel.schema, name: rel.name, rel, page: pages.get(rel.id), state: 'active' });
+    out.set(rel.id, { id: rel.id, schema: rel.schema, name: rel.name, rel, ref: refs.get(rel.id), state: 'active' });
   }
   const inScope = new Set(config.schemas);
-  for (const page of pages.values()) {
-    if (out.has(page.id)) continue;
-    const state = inScope.has(page.schema) ? 'removed' : 'out_of_scope';
-    out.set(page.id, { id: page.id, schema: page.schema, name: page.name, rel: null, page, state });
+  for (const ref of refs.values()) {
+    if (out.has(ref.id)) continue;
+    const state = inScope.has(ref.schema) ? 'removed' : 'out_of_scope';
+    out.set(ref.id, { id: ref.id, schema: ref.schema, name: ref.name, rel: null, ref, state });
   }
   return out;
+}
+
+async function loadPages(fs: ProjectFs, list: Subject[]): Promise<void> {
+  for (const s of list) if (s.ref && !s.page) s.page = await readPage(fs, s.ref);
 }
 
 /** Local warnings: structure, frontmatter, and page vs catalog. Explain never sees the live database. */
@@ -282,7 +290,7 @@ function warningsOf(s: Subject): Warning[] {
   }
   const invalid = page !== undefined && !page.parse.ok;
   const out = relationWarnings(s.rel, pageFront(page)).filter((w) => !(invalid && w.code === 'undocumented'));
-  if (!page) out.push({ code: 'page_missing' });
+  if (!s.ref || !page) out.push({ code: 'page_missing' });
   else if (!page.parse.ok) out.push({ code: 'context_invalid', reason: page.parse.reason, file: page.path });
   else {
     const p = page.parse.page;
@@ -398,7 +406,7 @@ function tableEntry(s: Subject, withNotes: boolean, index: number, ec: EntryCont
       : w,
   );
   if (warn.length > 0) entry.warn = warn;
-  if (page) entry.contextFile = page.path;
+  if (s.ref) entry.contextFile = s.ref.path;
   const untrusted = tableUntrusted(s, front, notes, ec.u, path);
   if (untrusted) entry.untrusted = untrusted;
   return entry;
@@ -540,8 +548,7 @@ export async function explain(root: string, req: ExplainRequest = {}): Promise<E
   validateRequest(req);
   const fs = await ProjectFs.open(root);
   const { config, catalog } = await loadProject(fs);
-  const pages = await readPages(fs, config);
-  const all = subjects(config, catalog, pages);
+  const all = subjects(config, catalog, await listPages(fs, config));
   const ec: EntryContext = { u: new Untrusted(), findings: [], partial: { value: false } };
 
   if (JSON.stringify(config.schemas) !== JSON.stringify(catalog.schemas)) {
@@ -583,6 +590,7 @@ export async function explain(root: string, req: ExplainRequest = {}): Promise<E
     const binding = cursorBinding(catalog.revision, search);
     const offset = req.cursor === undefined ? 0 : decodeCursor(req.cursor, binding, active.length);
     const slice = active.slice(offset, offset + limit);
+    await loadPages(fs, slice);
     const key = search === null ? 'overview' : 'matches';
     const entries = slice.map((s, i) => {
       const e = summary(s, ec.u, [key, i]);
@@ -625,6 +633,7 @@ export async function explain(root: string, req: ExplainRequest = {}): Promise<E
   }
 
   const chosen = [...requested, ...neighbors].map((id) => all.get(id)!);
+  await loadPages(fs, chosen);
   const tables = chosen.map((s, i) => tableEntry(s, (req.notes ?? false) && i < requested.length, i, ec));
 
   const external = new Set<string>();

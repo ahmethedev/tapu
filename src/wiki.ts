@@ -385,60 +385,72 @@ export function archivePage(text: string, id: string, state: Exclude<PageState, 
 // ---------------------------------------------------------------------------
 // Reading pages
 
-export interface PageFile {
+/** A page file found under `<wikiDir>/tables`, not yet read. */
+export interface PageRef {
   id: string;
   schema: string;
   name: string;
   file: string;
   /** Project-relative path. */
   path: string;
+}
+
+export interface PageFile extends PageRef {
   text: string | null;
   parse: PageParse;
 }
 
-/** All Tapu pages under `<wikiDir>/tables`, keyed by canonical ID. Other files are ignored. */
-export async function readPages(fs: ProjectFs, config: Config): Promise<Map<string, PageFile>> {
+async function readText(fs: ProjectFs, path: string): Promise<{ text: string | null; error: string | null }> {
+  try {
+    return { text: await fs.read(path), error: null };
+  } catch (err) {
+    return { text: null, error: err instanceof TapuError ? err.message : `cannot be read (${errorMessage(err)})` };
+  }
+}
+
+/** Identity of a hashed long file name, from its frontmatter; it must map back to the same file. */
+function hashedIdentity(file: string, text: string): { schema: string; name: string } | null {
+  const m = /^table: *(.+)$/m.exec(text);
+  const raw = m ? m[1]!.trim() : '';
+  let value = raw;
+  try {
+    value = raw.startsWith('"') ? (JSON.parse(raw) as string) : raw;
+  } catch {
+    return null;
+  }
+  const parts = parseQualifiedName(value);
+  return parts?.length === 2 && pageFileName(parts[0]!, parts[1]!) === file ? { schema: parts[0]!, name: parts[1]! } : null;
+}
+
+/** Tapu pages under `<wikiDir>/tables`, keyed by canonical ID, without reading them (except hashed names). */
+export async function listPages(fs: ProjectFs, config: Config): Promise<Map<string, PageRef>> {
   const dir = wikiPaths(config).tables;
-  const names = (await fs.list(dir)) ?? [];
-  const pages: PageFile[] = [];
-  for (const file of names) {
+  const refs: PageRef[] = [];
+  for (const file of (await fs.list(dir)) ?? []) {
     if (file.startsWith('.') || !file.endsWith('.md')) continue;
     const path = `${dir}/${file}`;
-    let text: string | null;
-    let readError: string | null = null;
-    try {
-      text = await fs.read(path);
-    } catch (err) {
-      text = null;
-      readError = err instanceof TapuError ? err.message : `cannot be read (${errorMessage(err)})`;
-    }
     let ident = decodePageFileName(file);
-    if (!ident && file.includes('~') && text !== null) {
-      // Hashed long names: identity comes from the frontmatter and must map back to this file.
-      const m = /^table: *(.+)$/m.exec(text);
-      const raw = m ? m[1]!.trim() : '';
-      let value = raw;
-      try {
-        value = raw.startsWith('"') ? (JSON.parse(raw) as string) : raw;
-      } catch {
-        value = '';
-      }
-      const parts = parseQualifiedName(value);
-      if (parts?.length === 2 && pageFileName(parts[0]!, parts[1]!) === file) ident = { schema: parts[0]!, name: parts[1]! };
+    if (!ident && file.includes('~')) {
+      const { text } = await readText(fs, path);
+      ident = text === null ? null : hashedIdentity(file, text);
     }
-    if (!ident) continue;
-    const id = qualifiedId(ident.schema, ident.name);
-    pages.push({
-      id,
-      ...ident,
-      file,
-      path,
-      text,
-      parse: text === null ? { ok: false, reason: readError ?? 'cannot be read' } : parsePage(text, id),
-    });
+    if (ident) refs.push({ id: qualifiedId(ident.schema, ident.name), ...ident, file, path });
   }
-  pages.sort((a, b) => compareStrings(a.id, b.id));
-  return new Map(pages.map((p) => [p.id, p]));
+  refs.sort((a, b) => compareStrings(a.id, b.id));
+  return new Map(refs.map((r) => [r.id, r]));
+}
+
+/** Reads and parses one page. Unreadable pages (including symbolic links) are parse failures. */
+export async function readPage(fs: ProjectFs, ref: PageRef): Promise<PageFile> {
+  const { text, error } = await readText(fs, ref.path);
+  return { ...ref, text, parse: text === null ? { ok: false, reason: error ?? 'cannot be read' } : parsePage(text, ref.id) };
+}
+
+/** All Tapu pages, read and parsed. */
+export async function readPages(fs: ProjectFs, config: Config): Promise<Map<string, PageFile>> {
+  const out = new Map<string, PageFile>();
+  for (const ref of (await listPages(fs, config)).values()) out.set(ref.id, await readPage(fs, ref));
+  return out;
 }
 
 export function pageFront(page: PageFile | undefined): Frontmatter | null {

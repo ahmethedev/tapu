@@ -1,7 +1,7 @@
 {
   "name": "tapu",
   "version": "0.1.0",
-  "description": "Agent-native memory layer for Postgres: a living, verified wiki of your schema for coding agents.",
+  "description": "Agent-native Postgres schema context: a persistent local catalog that coding agents search and retrieve selectively.",
   "license": "UNLICENSED",
   "type": "module",
   "bin": {
@@ -12,7 +12,7 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

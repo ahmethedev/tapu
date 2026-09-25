@@ -123,12 +123,11 @@ export async function introspect(
   const relRows = await session.query(RELATIONS_SQL, [schemas]);
   const oids = relRows.map((r) => str(r.oid));
 
-  const [colRows, conRows, idxRows, enumRows] = await Promise.all([
-    session.query(COLUMNS_SQL, [oids]),
-    session.query(CONSTRAINTS_SQL, [oids]),
-    session.query(INDEXES_SQL, [oids]),
-    session.query(ENUMS_SQL, [schemas]),
-  ]);
+  // One connection runs one query at a time.
+  const colRows = await session.query(COLUMNS_SQL, [oids]);
+  const conRows = await session.query(CONSTRAINTS_SQL, [oids]);
+  const idxRows = await session.query(INDEXES_SQL, [oids]);
+  const enumRows = await session.query(ENUMS_SQL, [schemas]);
   const colsByRel = groupBy(colRows);
   const consByRel = groupBy(conRows);
   const idxByRel = groupBy(idxRows);

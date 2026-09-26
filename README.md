@@ -1,4 +1,4 @@
-# Tapu
+<h1 align="center"><img src="assets/logo.png" alt="Tapu" width="360"></h1>
 
 Agent-native Postgres schema context. Tapu compiles database metadata into a persistent local catalog that coding agents can search and retrieve selectively, in batches, without rediscovering the database in every session.
 
